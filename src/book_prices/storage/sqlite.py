@@ -1,9 +1,9 @@
+import os
 import re
-import sqlite3
-from dataclasses import asdict
-from typing import Optional
+from typing import Optional, Tuple, List, Dict
 
-from book_prices.core.models import Offer
+import psycopg2
+import psycopg2.extras
 
 
 def title_norm(s: Optional[str]) -> Optional[str]:
@@ -13,52 +13,60 @@ def title_norm(s: Optional[str]) -> Optional[str]:
     t = t.replace("ё", "е")
     t = re.sub(r"[\"'`“”„’]", "", t)
     t = re.sub(r"[\(\)\[\]\{\}]", " ", t)
-    t = re.sub(r"[^0-9a-zA-Z\u10A0-\u10FF\u0400-\u04FF\s]+", " ", t)  # latin+ge+ru + digits
+    t = re.sub(r"[^0-9a-zA-Z\u10A0-\u10FF\u0400-\u04FF\s]+", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t or None
 
 
-class SqliteStore:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys=ON")
+class PostgresStore:
+    def __init__(self):
+        # Prefer DATABASE_URL, fallback to discrete env vars
+        dsn = os.getenv("DATABASE_URL")
+        if not dsn:
+            dsn = (
+                "dbname={db} user={user} password={pw} host={host} port={port}".format(
+                    db=os.getenv("PGDATABASE"),
+                    user=os.getenv("PGUSER"),
+                    pw=os.getenv("PGPASSWORD"),
+                    host=os.getenv("PGHOST"),
+                    port=os.getenv("PGPORT", "5432"),
+                )
+            )
 
-    def close(self) -> None:
+        self.conn = psycopg2.connect(dsn)
+        self.conn.autocommit = False
+
+    def close(self):
         self.conn.close()
 
-    def init_schema(self) -> None:
-        self.conn.executescript(
+    def init_schema(self):
+        cur = self.conn.cursor()
+        cur.execute(
             """
-            PRAGMA foreign_keys=ON;
-
             CREATE TABLE IF NOT EXISTS books (
-              id            INTEGER PRIMARY KEY AUTOINCREMENT,
-              isbn13        TEXT NOT NULL UNIQUE,
-              title         TEXT,
-              title_norm    TEXT,
-              created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+              id BIGSERIAL PRIMARY KEY,
+              isbn13 TEXT NOT NULL UNIQUE,
+              title TEXT,
+              title_norm TEXT,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
 
             CREATE TABLE IF NOT EXISTS store_products (
-              id               INTEGER PRIMARY KEY AUTOINCREMENT,
-              store            TEXT NOT NULL,
+              id BIGSERIAL PRIMARY KEY,
+              store TEXT NOT NULL,
               store_product_id TEXT NOT NULL,
-              url              TEXT NOT NULL,
-              book_id          INTEGER,
-              created_at       TEXT NOT NULL DEFAULT (datetime('now')),
-              UNIQUE(store, store_product_id),
-              FOREIGN KEY(book_id) REFERENCES books(id)
+              url TEXT NOT NULL,
+              book_id BIGINT REFERENCES books(id),
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              UNIQUE(store, store_product_id)
             );
 
             CREATE TABLE IF NOT EXISTS offers (
-              id               INTEGER PRIMARY KEY AUTOINCREMENT,
-              store_product_id INTEGER NOT NULL,
-              captured_at      TEXT NOT NULL DEFAULT (datetime('now')),
-              price_gel        REAL,
-              in_stock         INTEGER,
-              FOREIGN KEY(store_product_id) REFERENCES store_products(id)
+              id BIGSERIAL PRIMARY KEY,
+              store_product_id BIGINT NOT NULL REFERENCES store_products(id),
+              captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              price_gel NUMERIC,
+              in_stock BOOLEAN
             );
 
             CREATE INDEX IF NOT EXISTS idx_books_title_norm ON books(title_norm);
@@ -70,127 +78,115 @@ class SqliteStore:
 
     def _upsert_book(self, isbn13: str, title: Optional[str]) -> int:
         tnorm = title_norm(title)
-        self.conn.execute(
+        cur = self.conn.cursor()
+        cur.execute(
             """
             INSERT INTO books(isbn13, title, title_norm)
-            VALUES(?, ?, ?)
-            ON CONFLICT(isbn13) DO UPDATE SET
-              title = COALESCE(excluded.title, books.title),
-              title_norm = COALESCE(excluded.title_norm, books.title_norm)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (isbn13) DO UPDATE SET
+              title = COALESCE(EXCLUDED.title, books.title),
+              title_norm = COALESCE(EXCLUDED.title_norm, books.title_norm)
+            RETURNING id
             """,
             (isbn13, title, tnorm),
         )
-        row = self.conn.execute("SELECT id FROM books WHERE isbn13 = ?", (isbn13,)).fetchone()
-        return int(row["id"])
+        return int(cur.fetchone()[0])
 
     def _upsert_store_product(self, store: str, store_product_id: str, url: str, book_id: Optional[int]) -> int:
-        self.conn.execute(
+        cur = self.conn.cursor()
+        cur.execute(
             """
             INSERT INTO store_products(store, store_product_id, url, book_id)
-            VALUES(?, ?, ?, ?)
-            ON CONFLICT(store, store_product_id) DO UPDATE SET
-              url = excluded.url,
-              book_id = COALESCE(excluded.book_id, store_products.book_id)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (store, store_product_id) DO UPDATE SET
+              url = EXCLUDED.url,
+              book_id = COALESCE(EXCLUDED.book_id, store_products.book_id)
+            RETURNING id
             """,
             (store, store_product_id, url, book_id),
         )
-        row = self.conn.execute(
-            "SELECT id FROM store_products WHERE store=? AND store_product_id=?",
-            (store, store_product_id),
-        ).fetchone()
-        return int(row["id"])
+        return int(cur.fetchone()[0])
 
     def _last_offer(self, store_product_row_id: int):
-        return self.conn.execute(
+        cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
             """
             SELECT price_gel, in_stock
             FROM offers
-            WHERE store_product_id=?
+            WHERE store_product_id = %s
             ORDER BY captured_at DESC, id DESC
             LIMIT 1
             """,
             (store_product_row_id,),
-        ).fetchone()
-
-    def upsert_offer(self, offer: Offer) -> None:
-        """
-        Matching rule v1:
-        - If offer.isbn exists -> create/find book by isbn13 and attach store_product to it.
-        - If isbn missing -> store_product.book_id stays NULL (unmatched for now).
-        Insert into offers only if (price_gel/in_stock) changed vs last snapshot.
-        """
-        self.conn.execute("BEGIN")
-
-        book_id = None
-        if offer.isbn:
-            book_id = self._upsert_book(offer.isbn, offer.title)
-
-        sp_id = self._upsert_store_product(
-            store=offer.store,
-            store_product_id=str(offer.store_product_id),
-            url=offer.url,
-            book_id=book_id,
         )
+        return cur.fetchone()
 
-        last = self._last_offer(sp_id)
+    def upsert_offer(self, offer) -> None:
+        cur = self.conn.cursor()
+        try:
+            book_id = None
+            if offer.isbn:
+                book_id = self._upsert_book(offer.isbn, offer.title)
 
-        changed = True
-        if last is not None:
-            last_price = last["price_gel"]
-            last_stock = last["in_stock"]
-            cur_stock = None if offer.in_stock is None else (1 if offer.in_stock else 0)
-            # note: float compare is fine here; prices are 2-decimal.
-            changed = (last_price != offer.price_gel) or (last_stock != cur_stock)
-
-        if changed:
-            self.conn.execute(
-                "INSERT INTO offers(store_product_id, price_gel, in_stock) VALUES(?, ?, ?)",
-                (
-                    sp_id,
-                    offer.price_gel,
-                    None if offer.in_stock is None else (1 if offer.in_stock else 0),
-                ),
+            sp_id = self._upsert_store_product(
+                offer.store, str(offer.store_product_id), offer.url, book_id
             )
 
-        self.conn.commit()
+            last = self._last_offer(sp_id)
 
-    # ---------- read API helpers ----------
+            changed = True
+            if last is not None:
+                changed = (str(last["price_gel"]) != str(offer.price_gel)) or (last["in_stock"] != offer.in_stock)
+
+            if changed:
+                cur.execute(
+                    "INSERT INTO offers(store_product_id, price_gel, in_stock) VALUES (%s, %s, %s)",
+                    (sp_id, offer.price_gel, offer.in_stock),
+                )
+
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def get_book_by_isbn(self, isbn13: str):
-        book = self.conn.execute("SELECT * FROM books WHERE isbn13=?", (isbn13,)).fetchone()
+        cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cur.execute("SELECT * FROM books WHERE isbn13=%s", (isbn13,))
+        book = cur.fetchone()
         if not book:
             return None
 
-        offers = self.conn.execute(
+        cur.execute(
             """
-            SELECT sp.store, sp.url,
-                   o.price_gel, o.in_stock, o.captured_at
+            SELECT sp.store, sp.url, o.price_gel, o.in_stock, o.captured_at
             FROM store_products sp
-            JOIN (
-              SELECT store_product_id, MAX(captured_at) AS captured_at
+            JOIN LATERAL (
+              SELECT price_gel, in_stock, captured_at
               FROM offers
-              GROUP BY store_product_id
-            ) latest ON latest.store_product_id = sp.id
-            JOIN offers o
-              ON o.store_product_id = latest.store_product_id
-             AND o.captured_at = latest.captured_at
-            WHERE sp.book_id = ?
+              WHERE store_product_id = sp.id
+              ORDER BY captured_at DESC, id DESC
+              LIMIT 1
+            ) o ON TRUE
+            WHERE sp.book_id = %s
             ORDER BY (o.in_stock IS NULL) ASC, o.in_stock DESC, o.price_gel ASC
             """,
             (book["id"],),
-        ).fetchall()
-
+        )
+        offers = cur.fetchall()
         return dict(book), [dict(x) for x in offers]
 
     def search_books(self, q: str, limit: int = 20):
         qn = title_norm(q) or ""
-        rows = self.conn.execute(
+        cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
             """
             SELECT id, isbn13, title
             FROM books
-            WHERE title_norm LIKE ?
+            WHERE title_norm ILIKE %s
             ORDER BY id DESC
-            LIMIT ?
+            LIMIT %s
             """,
             (f"%{qn}%", limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        )
+        return [dict(r) for r in cur.fetchall()]
