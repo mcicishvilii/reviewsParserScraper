@@ -1,2 +1,29 @@
-/requirements.txt
-/reviewsEnv
+# Virtual environment
+venv/
+.venv/
+
+# Python bytecode / cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment variables
+.env
+
+# IDE / editor
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Scraper outputs (keep repo clean)
+data/
+output/
+*.csv
+*.json
+
+# Logs
+*.log
