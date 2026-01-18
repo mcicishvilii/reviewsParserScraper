@@ -20,21 +20,15 @@ def title_norm(s: Optional[str]) -> Optional[str]:
 
 class PostgresStore:
     def __init__(self):
-        # Prefer DATABASE_URL, fallback to discrete env vars
-        dsn = os.getenv("DATABASE_URL")
-        if not dsn:
-            dsn = (
-                "dbname={db} user={user} password={pw} host={host} port={port}".format(
-                    db=os.getenv("PGDATABASE"),
-                    user=os.getenv("PGUSER"),
-                    pw=os.getenv("PGPASSWORD"),
-                    host=os.getenv("PGHOST"),
-                    port=os.getenv("PGPORT", "5432"),
-                )
-            )
-
+        # This will now find the variables loaded by load_dotenv()
+        host = os.getenv('DB_HOST')
+        dbname = os.getenv('DB_NAME')
+        user = os.getenv('DB_USER')
+        password = os.getenv('DB_PASS')
+        port = os.getenv('DB_PORT', '5432')
+        
+        dsn = f"host={host} dbname={dbname} user={user} password={password} port={port}"
         self.conn = psycopg2.connect(dsn)
-        self.conn.autocommit = False
 
     def close(self):
         self.conn.close()

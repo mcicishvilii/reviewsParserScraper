@@ -4,7 +4,7 @@ import requests
 from book_prices.core.http import HttpClient
 from book_prices.adapters.biblusi import BiblusiAdapter
 from book_prices.adapters.parnasi import ParnasiAdapter
-from book_prices.storage.sqlite import SqliteStore
+from book_prices.storage.postgres import SqliteStore
 
 SLEEP_SECONDS = 0.25
 DB_PATH = "book_prices.sqlite3"
