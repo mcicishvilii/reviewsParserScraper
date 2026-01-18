@@ -7,7 +7,6 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
-# ---------- Config ----------
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; reviewsParserScraper/0.1; +https://example.com)"
 }
@@ -20,7 +19,6 @@ SLEEP_SECONDS = 0.25
 PRODUCT_HREF_RE = re.compile(r"^/products/\d+$")
 PRICE_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*₾")
 
-# IMPORTANT: ISBN must appear AFTER the "ISBN" label
 ISBN_LABELED_RE = re.compile(
     r"\bISBN\b\s*[:#]?\s*([0-9Xx][0-9Xx\s\-]{8,20})"
 )
@@ -29,18 +27,29 @@ SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
 
 
-# ---------- Data ----------
 @dataclass
 class Product:
     product_id: int
     url: str
 
 
-# ---------- Helpers ----------
 def fetch_soup(url: str) -> BeautifulSoup:
     r = SESSION.get(url, timeout=25)
     r.raise_for_status()
     return BeautifulSoup(r.text, "lxml")
+
+IN_STOCK_TEXT = "მარაგშია"
+OUT_OF_STOCK_TEXT = "არ არის მარაგში"
+
+def extract_availability(soup: BeautifulSoup) -> bool | None:
+    text = soup.get_text(" ", strip=True)
+
+    if OUT_OF_STOCK_TEXT in text:
+        return False
+    if IN_STOCK_TEXT in text:
+        return True
+
+    return None
 
 
 def normalize_price(price_str: str) -> float:
@@ -95,7 +104,6 @@ def extract_isbn(soup: BeautifulSoup) -> str | None:
     return None
 
 
-# ---------- Scraping ----------
 def extract_products_from_listing(listing_url: str) -> list[Product]:
     soup = fetch_soup(listing_url)
 
@@ -132,13 +140,16 @@ def extract_title_price_isbn_from_product_page(product_url: str) -> dict:
     price_gel = normalize_price(m_price.group(1)) if m_price else None
 
     isbn = extract_isbn(soup)
+    in_stock = extract_availability(soup)
 
     return {
         "url": product_url,
         "title": title,
         "price_gel": price_gel,
         "isbn": isbn,
+        "in_stock": in_stock,
     }
+
 
 
 def scrape_pages(category_id: int, start_page: int, pages_to_scrape: int) -> list[Product]:
@@ -162,7 +173,6 @@ def scrape_pages(category_id: int, start_page: int, pages_to_scrape: int) -> lis
     return all_products
 
 
-# ---------- Main ----------
 def main() -> None:
     products = scrape_pages(CATEGORY_ID, START_PAGE, PAGES_TO_SCRAPE)
 
